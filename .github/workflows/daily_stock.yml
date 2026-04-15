@@ -1,0 +1,31 @@
+name: Daily Stock Collection
+
+on:
+  schedule:
+    # 평일 16:30 KST = UTC 07:30 (KST = UTC+9)
+    - cron: '30 7 * * 1-5'
+  workflow_dispatch:  # 수동 실행 버튼 활성화
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run stock collection
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python collect_stocks.py
