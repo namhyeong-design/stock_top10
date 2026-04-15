@@ -134,6 +134,18 @@ def fetch_market_df(market: str) -> pd.DataFrame:
     # 거래량/거래대금이 0이거나 NaN인 종목 제거 (미거래 종목)
     df = df[df["volume"].fillna(0) > 0]
 
+    # ── 등락률 보완 ────────────────────────────────────────────────────────────
+    # fdr.StockListing 이 ChangesRatio 를 제공하지 않거나 전부 NaN인 경우,
+    # Changes(등락 금액)와 Close(종가)로 직접 계산: 등락률 = Changes / (Close - Changes) * 100
+    if "change_rate" not in df.columns or df["change_rate"].isna().all():
+        print(f"  {market}: change_rate 없음 → Changes/Close 로 직접 계산")
+        if "change" in df.columns and "close" in df.columns:
+            prev_close = df["close"] - df["change"]
+            df["change_rate"] = (df["change"] / prev_close.replace(0, float("nan")) * 100).round(2)
+        else:
+            print(f"  ⚠️  {market}: 등락률 계산 불가 (change/close 컬럼 없음)")
+            df["change_rate"] = None
+
     print(f"  {market}: {len(df)}개 종목 (거래 있음)")
     return df
 
