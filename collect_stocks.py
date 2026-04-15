@@ -1,6 +1,7 @@
 """
 collect_stocks.py
 KOSPI + KOSDAQ 거래대금 TOP10 / 거래량 TOP10 / 상승률 TOP10 수집 → Supabase upsert
+pykrx==1.0.47 기준 (인증 불필요 버전)
 """
 
 import os
@@ -38,46 +39,9 @@ def get_trading_date() -> str:
     raise RuntimeError("최근 10일 이내 거래일 데이터를 찾을 수 없습니다.")
 
 
-# ── 컬럼명 정규화 ───────────────────────────────────────────────────────────────
-# pykrx 버전에 따라 한글 또는 영문 컬럼명이 혼재하므로 양쪽 모두 대응
-COLUMN_ALIASES = {
-    # 한글 → 내부 표준명
-    "티커":   "ticker",
-    "시가":   "open",
-    "고가":   "high",
-    "저가":   "low",
-    "종가":   "close",
-    "거래량": "volume",
-    "거래대금": "trading_value",
-    "등락률": "change_rate",
-    "등락률(%)": "change_rate",
-    # 영문(혹시 있을 경우)
-    "open":  "open",
-    "high":  "high",
-    "low":   "low",
-    "close": "close",
-    "volume": "volume",
-    "amount": "trading_value",
-    "changes": "change",
-    "changescode": "changes_code",
-}
-
-
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """컬럼명을 내부 표준명으로 변환."""
-    df = df.reset_index()
-    df.columns.name = None
-    new_cols = []
-    for c in df.columns:
-        mapped = COLUMN_ALIASES.get(c, COLUMN_ALIASES.get(c.lower(), c.lower()))
-        new_cols.append(mapped)
-    df.columns = new_cols
-    return df
-
-
 # ── 시장별 OHLCV 조회 ──────────────────────────────────────────────────────────
 def fetch_market_df(date: str, market: str) -> pd.DataFrame:
-    """지정 시장의 OHLCV 데이터를 가져와 정리."""
+    """pykrx 1.0.47 기준 OHLCV 데이터 조회."""
     try:
         df = stock.get_market_ohlcv_by_ticker(date, market=market)
     except Exception as e:
@@ -88,20 +52,31 @@ def fetch_market_df(date: str, market: str) -> pd.DataFrame:
         print(f"  ⚠️  {market}: 데이터 없음")
         return pd.DataFrame()
 
-    # 디버그: 실제 컬럼명 출력 (트러블슈팅용)
-    print(f"  {market} 원본 컬럼: {list(df.columns)}")
+    # 디버그: 실제 컬럼 확인
+    print(f"  {market} 컬럼: {list(df.columns)}")
 
-    df = normalize_columns(df)
-    print(f"  {market} 정규화 컬럼: {list(df.columns)}")
+    df = df.reset_index()
+    df.columns.name = None
 
-    # change_rate 컬럼이 없으면 pykrx 별도 API로 보완
-    if "change_rate" not in df.columns:
-        print(f"  {market}: change_rate 없음 → fundamental 데이터로 보완 시도")
-        try:
-            df_fund = stock.get_market_ohlcv_by_ticker(date, market=market)
-            # 등락률 재시도: get_market_cap 등에서 가져오는 방법
-        except Exception:
-            pass
+    # pykrx 1.0.47 컬럼명: 티커, 시가, 고가, 저가, 종가, 거래량, 거래대금, 등락률
+    rename_map = {
+        "티커":    "ticker",
+        "시가":    "open",
+        "고가":    "high",
+        "저가":    "low",
+        "종가":    "close",
+        "거래량":  "volume",
+        "거래대금": "trading_value",
+        "등락률":  "change_rate",
+    }
+    df.rename(columns=rename_map, inplace=True)
+
+    # index 컬럼(티커)이 'index' 또는 'Ticker'로 들어오는 경우 대응
+    if "ticker" not in df.columns:
+        for col in df.columns:
+            if col.lower() in ("index", "ticker", "종목코드"):
+                df.rename(columns={col: "ticker"}, inplace=True)
+                break
 
     # 종목명 추가
     def safe_name(t: str) -> str:
@@ -118,43 +93,15 @@ def fetch_market_df(date: str, market: str) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         else:
-            df[col] = None  # 컬럼 없으면 None으로 채움
+            df[col] = None
 
-    return df
-
-
-# ── change_rate 보완 (get_market_price_change_by_ticker) ───────────────────────
-def enrich_change_rate(df: pd.DataFrame, date: str, market: str) -> pd.DataFrame:
-    """change_rate가 전부 None이면 별도 API로 보완."""
-    if df.empty or df["change_rate"].notna().any():
-        return df
-    print(f"  {market}: change_rate 보완 시도 (get_market_price_change_by_ticker)")
-    try:
-        df_ch = stock.get_market_price_change_by_ticker(date, date, market=market)
-        df_ch = df_ch.reset_index()
-        df_ch.columns.name = None
-        # 컬럼명 정규화
-        for col in df_ch.columns:
-            if "등락률" in col or "change" in col.lower():
-                df_ch = df_ch.rename(columns={col: "change_rate_fill"})
-                break
-        if "change_rate_fill" in df_ch.columns and "ticker" in df_ch.columns:
-            df_ch["change_rate_fill"] = pd.to_numeric(df_ch["change_rate_fill"], errors="coerce")
-            df = df.merge(
-                df_ch[["ticker", "change_rate_fill"]],
-                on="ticker", how="left"
-            )
-            df["change_rate"] = df["change_rate"].combine_first(df["change_rate_fill"])
-            df.drop(columns=["change_rate_fill"], inplace=True)
-    except Exception as e:
-        print(f"  ⚠️  change_rate 보완 실패: {e}")
     return df
 
 
 # ── TOP 10 추출 ────────────────────────────────────────────────────────────────
 def get_top10(df: pd.DataFrame, sort_col: str, ascending: bool = False) -> pd.DataFrame:
     if df.empty or sort_col not in df.columns:
-        print(f"  ⚠️  {sort_col} 컬럼 없음, 건너뜀")
+        print(f"  ⚠️  '{sort_col}' 컬럼 없음 → 건너뜀")
         return pd.DataFrame()
     return (
         df.dropna(subset=[sort_col])
@@ -175,6 +122,20 @@ def upsert_rows(rows: list) -> None:
     print(f"  Supabase 응답: {len(result.data)}개 처리됨")
 
 
+# ── 헬퍼 ──────────────────────────────────────────────────────────────────────
+def safe_int(val):
+    try:
+        return int(val) if pd.notna(val) else None
+    except Exception:
+        return None
+
+def safe_float(val, decimals=2):
+    try:
+        return round(float(val), decimals) if pd.notna(val) else None
+    except Exception:
+        return None
+
+
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     print("=" * 50)
@@ -184,12 +145,10 @@ def main() -> None:
     date_formatted = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
     print(f"▶ 수집 날짜: {date_formatted}")
 
-    # KOSPI + KOSDAQ 통합
     frames = []
     for market in ("KOSPI", "KOSDAQ"):
         df = fetch_market_df(date_str, market)
         if not df.empty:
-            df = enrich_change_rate(df, date_str, market)
             frames.append(df)
             print(f"  {market}: {len(df)}개 종목 수집 완료")
 
@@ -213,18 +172,6 @@ def main() -> None:
         if top10.empty:
             continue
         for rank, row in enumerate(top10.itertuples(), start=1):
-            def safe_int(val):
-                try:
-                    return int(val) if pd.notna(val) else None
-                except Exception:
-                    return None
-
-            def safe_float(val):
-                try:
-                    return round(float(val), 2) if pd.notna(val) else None
-                except Exception:
-                    return None
-
             record = {
                 "date":          date_formatted,
                 "category":      category,
