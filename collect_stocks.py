@@ -1,14 +1,14 @@
 """
 collect_stocks.py
-KOSPI + KOSDAQ 거래대금 TOP10 / 거래량 TOP10 / 상승률 TOP10 수집 → Supabase upsert
-pykrx==1.0.47 기준 (인증 불필요 버전)
+FinanceDataReader 기반 KOSPI + KOSDAQ 주식 데이터 수집
+- 거래대금 TOP10 / 거래량 TOP10 / 상승률 TOP10 → Supabase upsert
 """
 
 import os
 import sys
 import datetime
 import pandas as pd
-from pykrx import stock
+import FinanceDataReader as fdr
 from supabase import create_client, Client
 
 # ── Supabase 연결 ──────────────────────────────────────────────────────────────
@@ -21,86 +21,128 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ── 영문 → 한글 컬럼명 매핑 (FinanceDataReader 기준) ─────────────────────────
+# fdr.StockListing 반환 컬럼: Symbol, Name, Close, Changes, ChangesRatio,
+#                              Open, High, Low, Volume, Amount, Marcap 등
+COLUMN_EN_TO_KR = {
+    "Symbol":        "티커",
+    "Name":          "종목명",
+    "Open":          "시가",
+    "High":          "고가",
+    "Low":           "저가",
+    "Close":         "종가",
+    "Volume":        "거래량",
+    "Amount":        "거래대금",
+    "Changes":       "등락",
+    "ChangesRatio":  "등락률",
+    "Marcap":        "시가총액",
+    "Stocks":        "상장주식수",
+    "Market":        "시장구분",
+}
+
+# 내부 처리용 표준 컬럼명 (한글 → 내부명)
+COLUMN_KR_TO_INTERNAL = {
+    "티커":    "ticker",
+    "종목명":  "name",
+    "시가":    "open",
+    "고가":    "high",
+    "저가":    "low",
+    "종가":    "close",
+    "거래량":  "volume",
+    "거래대금": "trading_value",
+    "등락":    "change",
+    "등락률":  "change_rate",
+    "시가총액": "marcap",
+    "상장주식수": "stocks",
+    "시장구분": "market_label",
+}
+
+
+def rename_to_korean(df: pd.DataFrame) -> pd.DataFrame:
+    """영문 컬럼명 → 한글 컬럼명 변환"""
+    return df.rename(columns=COLUMN_EN_TO_KR)
+
+
+def rename_to_internal(df: pd.DataFrame) -> pd.DataFrame:
+    """한글 컬럼명 → 내부 표준명 변환"""
+    return df.rename(columns=COLUMN_KR_TO_INTERNAL)
+
 
 # ── 수집 날짜 결정 ──────────────────────────────────────────────────────────────
 def get_trading_date() -> str:
-    """가장 최근 영업일 날짜(YYYYMMDD)를 반환."""
+    """
+    가장 최근 영업일 날짜(YYYY-MM-DD) 반환.
+    주말이면 직전 금요일로 후퇴.
+    """
     today = datetime.date.today()
-    for offset in range(10):
-        candidate = (today - datetime.timedelta(days=offset)).strftime("%Y%m%d")
-        try:
-            df = stock.get_market_ohlcv_by_ticker(candidate, market="KOSPI")
-            if df is not None and not df.empty:
-                print(f"  영업일 확인: {candidate}")
-                return candidate
-        except Exception as e:
-            print(f"  {candidate} 조회 실패: {e}")
-            continue
-    raise RuntimeError("최근 10일 이내 거래일 데이터를 찾을 수 없습니다.")
+    weekday = today.weekday()  # 0=월 … 6=일
+    if weekday == 5:           # 토요일 → 금요일
+        today -= datetime.timedelta(days=1)
+    elif weekday == 6:         # 일요일 → 금요일
+        today -= datetime.timedelta(days=2)
+    return today.strftime("%Y-%m-%d")
 
 
-# ── 시장별 OHLCV 조회 ──────────────────────────────────────────────────────────
-def fetch_market_df(date: str, market: str) -> pd.DataFrame:
-    """pykrx 1.0.47 기준 OHLCV 데이터 조회."""
+# ── 시장별 데이터 조회 ──────────────────────────────────────────────────────────
+def fetch_market_df(market: str) -> pd.DataFrame:
+    """
+    fdr.StockListing(market) 으로 전 종목 시세 조회 후 정규화.
+    market: 'KOSPI' 또는 'KOSDAQ'
+    """
+    print(f"  {market} 조회 중...")
     try:
-        df = stock.get_market_ohlcv_by_ticker(date, market=market)
+        df = fdr.StockListing(market)
     except Exception as e:
-        print(f"  ⚠️  {market} 조회 오류: {e}")
+        print(f"  ⚠️  {market} 조회 실패: {e}")
         return pd.DataFrame()
 
     if df is None or df.empty:
         print(f"  ⚠️  {market}: 데이터 없음")
         return pd.DataFrame()
 
-    # 디버그: 실제 컬럼 확인
-    print(f"  {market} 컬럼: {list(df.columns)}")
+    # 디버그: 원본 컬럼 확인
+    print(f"  {market} 원본 컬럼: {list(df.columns)}")
 
+    # 인덱스가 Symbol인 경우 컬럼으로 내림
     df = df.reset_index()
-    df.columns.name = None
+    if "index" in df.columns:
+        df.drop(columns=["index"], inplace=True)
 
-    # pykrx 1.0.47 컬럼명: 티커, 시가, 고가, 저가, 종가, 거래량, 거래대금, 등락률
-    rename_map = {
-        "티커":    "ticker",
-        "시가":    "open",
-        "고가":    "high",
-        "저가":    "low",
-        "종가":    "close",
-        "거래량":  "volume",
-        "거래대금": "trading_value",
-        "등락률":  "change_rate",
-    }
-    df.rename(columns=rename_map, inplace=True)
+    # 영문 → 한글 → 내부 표준명 순으로 변환
+    df = rename_to_korean(df)
+    df = rename_to_internal(df)
 
-    # index 컬럼(티커)이 'index' 또는 'Ticker'로 들어오는 경우 대응
+    print(f"  {market} 정규화 컬럼: {list(df.columns)}")
+
+    # ticker 컬럼 확보 (Symbol이 index였던 경우 대응)
     if "ticker" not in df.columns:
         for col in df.columns:
-            if col.lower() in ("index", "ticker", "종목코드"):
+            if col.lower() in ("symbol", "code", "종목코드"):
                 df.rename(columns={col: "ticker"}, inplace=True)
                 break
 
-    # 종목명 추가
-    def safe_name(t: str) -> str:
-        try:
-            return stock.get_market_ticker_name(t) or t
-        except Exception:
-            return t
-
-    df["name"] = df["ticker"].apply(safe_name)
+    # 시장 구분 고정
     df["market"] = market
 
-    # 숫자형 변환
+    # 숫자형 강제 변환
     for col in ["close", "change_rate", "volume", "trading_value"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         else:
             df[col] = None
 
+    # 거래량/거래대금이 0이거나 NaN인 종목 제거 (미거래 종목)
+    df = df[df["volume"].fillna(0) > 0]
+
+    print(f"  {market}: {len(df)}개 종목 (거래 있음)")
     return df
 
 
 # ── TOP 10 추출 ────────────────────────────────────────────────────────────────
 def get_top10(df: pd.DataFrame, sort_col: str, ascending: bool = False) -> pd.DataFrame:
-    if df.empty or sort_col not in df.columns:
+    if df.empty:
+        return pd.DataFrame()
+    if sort_col not in df.columns:
         print(f"  ⚠️  '{sort_col}' 컬럼 없음 → 건너뜀")
         return pd.DataFrame()
     return (
@@ -129,7 +171,7 @@ def safe_int(val):
     except Exception:
         return None
 
-def safe_float(val, decimals=2):
+def safe_float(val, decimals: int = 2):
     try:
         return round(float(val), decimals) if pd.notna(val) else None
     except Exception:
@@ -139,18 +181,17 @@ def safe_float(val, decimals=2):
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     print("=" * 50)
-    print("▶ 주식 데이터 수집 시작")
+    print("▶ 주식 데이터 수집 시작 (FinanceDataReader)")
 
-    date_str = get_trading_date()
-    date_formatted = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+    date_formatted = get_trading_date()
     print(f"▶ 수집 날짜: {date_formatted}")
 
+    # KOSPI + KOSDAQ 통합
     frames = []
     for market in ("KOSPI", "KOSDAQ"):
-        df = fetch_market_df(date_str, market)
+        df = fetch_market_df(market)
         if not df.empty:
             frames.append(df)
-            print(f"  {market}: {len(df)}개 종목 수집 완료")
 
     if not frames:
         print("❌ 수집된 데이터가 없습니다.")
@@ -159,10 +200,11 @@ def main() -> None:
     combined = pd.concat(frames, ignore_index=True)
     print(f"▶ 통합 종목 수: {len(combined)}개")
 
+    # 카테고리 정의: {저장 키: (정렬 컬럼, 오름차순 여부)}
     categories = {
-        "trading_value":  ("trading_value", False),
-        "trading_volume": ("volume", False),
-        "top_rise":       ("change_rate", False),
+        "trading_value":  ("trading_value", False),   # 거래대금 TOP10
+        "trading_volume": ("volume",        False),   # 거래량 TOP10
+        "top_rise":       ("change_rate",   False),   # 상승률 TOP10
     }
 
     all_rows: list = []
