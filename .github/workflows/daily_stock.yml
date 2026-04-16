@@ -2,8 +2,8 @@ name: Daily Stock Collection
 
 on:
   schedule:
-    # 평일 16:30 KST = UTC 07:30 (KST = UTC+9)
-    - cron: '30 7 * * 1-5'
+    # 평일 15:40 KST = UTC 06:40 (KST = UTC+9) — 장마감(15:30) 10분 후 수집
+    - cron: '40 6 * * 1-5'
   workflow_dispatch:  # 수동 실행 버튼 활성화
 
 jobs:
