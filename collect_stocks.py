@@ -72,11 +72,9 @@ def rename_to_internal(df: pd.DataFrame) -> pd.DataFrame:
 def get_trading_date() -> str:
     """
     가장 최근 영업일 날짜(YYYY-MM-DD) 반환.
-    KST(UTC+9) 기준으로 날짜 계산 — GitHub Actions 러너는 UTC이므로 명시 필요.
     주말이면 직전 금요일로 후퇴.
     """
-    KST = datetime.timezone(datetime.timedelta(hours=9))
-    today = datetime.datetime.now(KST).date()
+    today = datetime.date.today()
     weekday = today.weekday()  # 0=월 … 6=일
     if weekday == 5:           # 토요일 → 금요일
         today -= datetime.timedelta(days=1)
