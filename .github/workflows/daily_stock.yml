@@ -29,6 +29,6 @@ jobs:
 
       - name: Run stock collection
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          HIT_UPPER_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          HIT_UPPER_SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python collect_stocks.py

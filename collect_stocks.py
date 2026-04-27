@@ -7,19 +7,21 @@ FinanceDataReader 기반 KOSPI + KOSDAQ 주식 데이터 수집
 import os
 import sys
 import datetime
+from pathlib import Path
 import pandas as pd
 import FinanceDataReader as fdr
 from supabase import create_client, Client
 
-# ── Supabase 연결 ──────────────────────────────────────────────────────────────
-SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY: str = os.environ.get("SUPABASE_KEY", "")
+# .env 자동 로드 (부모 디렉터리 우선)
+try:
+    from dotenv import load_dotenv
+    _here = Path(__file__).parent
+    _env = _here.parent / ".env"
+    load_dotenv(_env if _env.exists() else _here / ".env")
+except ImportError:
+    pass
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("❌ 환경변수 SUPABASE_URL / SUPABASE_KEY 가 설정되지 않았습니다.")
-    sys.exit(1)
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client | None = None
 
 # ── 영문 → 한글 컬럼명 매핑 (FinanceDataReader 기준) ─────────────────────────
 # fdr.StockListing 반환 컬럼: Symbol, Name, Close, Changes, ChangesRatio,
@@ -150,6 +152,26 @@ def fetch_market_df(market: str) -> pd.DataFrame:
     return df
 
 
+# ── 제외 필터 (스팩 / ETF·ETN / 레버리지·인버스·선물·신주인수권) ──────────────
+_ETF_PREFIXES = (
+    "KODEX", "TIGER", "ARIRANG", "HANARO", "KBSTAR", "ACE", "PLUS",
+    "SOL", "RISE", "KOSEF", "TIMEFOLIO", "KINDEX", "SMART", "FOCUS",
+    "TRUSTON", "BNK", "WOORI", "KTOP", "마이티", "파워",
+)
+
+# 이름 내 포함 여부로 판단하는 제외 키워드 (대소문자 무관)
+_EXCLUDED_KEYWORDS = ("스팩", "ETN", "레버리지", "인버스", "선물", "신주인수권")
+
+
+def _is_excluded(name: str) -> bool:
+    if not isinstance(name, str):
+        return False
+    u = name.upper()
+    if any(kw.upper() in u for kw in _EXCLUDED_KEYWORDS):
+        return True
+    return any(u.startswith(p) for p in _ETF_PREFIXES)
+
+
 # ── TOP 10 추출 ────────────────────────────────────────────────────────────────
 def get_top10(df: pd.DataFrame, sort_col: str, ascending: bool = False) -> pd.DataFrame:
     if df.empty:
@@ -192,6 +214,15 @@ def safe_float(val, decimals: int = 2):
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 def main() -> None:
+    global supabase
+    supabase_url = os.environ.get("HIT_UPPER_SUPABASE_URL", "")
+    supabase_key = os.environ.get("HIT_UPPER_SUPABASE_SERVICE_KEY", "")
+    if not supabase_url or not supabase_key:
+        print("HIT_UPPER_SUPABASE_URL / HIT_UPPER_SUPABASE_SERVICE_KEY 환경변수가 설정되지 않았습니다.")
+        return
+    if supabase is None:
+        supabase = create_client(supabase_url, supabase_key)
+
     print("=" * 50)
     print("▶ 주식 데이터 수집 시작 (FinanceDataReader)")
 
@@ -207,22 +238,28 @@ def main() -> None:
 
     if not frames:
         print("❌ 수집된 데이터가 없습니다.")
-        sys.exit(1)
+        return
 
     combined = pd.concat(frames, ignore_index=True)
-    print(f"▶ 통합 종목 수: {len(combined)}개")
+    before = len(combined)
+    combined = combined[~combined["name"].apply(_is_excluded)]
+    print(f"▶ 통합 종목 수: {len(combined)}개 (스팩·ETF·ETN {before - len(combined)}개 제외)")
 
-    # 카테고리 정의: {저장 키: (정렬 컬럼, 오름차순 여부)}
-    categories = {
-        "trading_value":  ("trading_value", False),   # 거래대금 TOP10
-        "trading_volume": ("volume",        False),   # 거래량 TOP10
-        "top_rise":       ("change_rate",   False),   # 상승률 TOP10
-    }
+    # 카테고리 정의: {저장 키: (정렬 컬럼, 오름차순 여부, 필터 DataFrame 또는 None)}
+    # top_drop은 하락 종목(change_rate < 0)만 대상으로 오름차순 정렬
+    dropping = combined[combined["change_rate"].fillna(0) < 0]
+    print(f"▶ 하락 종목 수 (change_rate < 0, 스팩·ETF·ETN 제외): {len(dropping)}개")
+    categories = [
+        ("trading_value",  combined,  "trading_value", False),   # 거래대금 TOP10
+        ("trading_volume", combined,  "volume",        False),   # 거래량 TOP10
+        ("top_rise",       combined,  "change_rate",   False),   # 상승률 TOP10
+        ("top_drop",       dropping,  "change_rate",   True),    # 하락률 TOP10
+    ]
 
     all_rows: list = []
 
-    for category, (sort_col, asc) in categories.items():
-        top10 = get_top10(combined, sort_col, ascending=asc)
+    for category, source_df, sort_col, asc in categories:
+        top10 = get_top10(source_df, sort_col, ascending=asc)
         if top10.empty:
             continue
         for rank, row in enumerate(top10.itertuples(), start=1):
@@ -243,10 +280,18 @@ def main() -> None:
 
     if not all_rows:
         print("❌ 저장할 데이터가 없습니다.")
-        sys.exit(1)
+        return
 
     upsert_rows(all_rows)
-    print(f"✅ 완료: 총 {len(all_rows)}개 행 저장 ({date_formatted})")
+    print(f"[DONE] 총 {len(all_rows)}개 행 저장 완료 ({date_formatted})")
+
+    # ── 52주 신고가 수집 (같은 listing 데이터 재사용) ─────────────────────────
+    try:
+        from collect_52upper import collect_and_save_52upper
+        collect_and_save_52upper(combined, supabase, date_formatted)
+    except Exception as e:
+        print(f"[52_UPPER] 수집 예외 (stock_top10 결과에는 영향 없음): {e}")
+
     print("=" * 50)
 
 
