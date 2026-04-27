@@ -37,6 +37,7 @@ COLUMN_EN_TO_KR = {
     "Amount":        "거래대금",
     "Changes":       "등락",
     "ChangesRatio":  "등락률",
+    "ChagesRatio":   "등락률",   # fdr 오타 컬럼명 대응
     "Marcap":        "시가총액",
     "Stocks":        "상장주식수",
     "Market":        "시장구분",
